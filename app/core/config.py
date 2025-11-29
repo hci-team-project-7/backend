@@ -13,7 +13,9 @@ class Settings(BaseSettings):
     openai_model_itinerary: str = "gpt-4.1"
     openai_model_chat: str = "gpt-4.1-mini"
 
+    google_places_api_key: str | None = None
     google_routes_api_key: str | None = None
+    firecrawl_api_key: str | None = None
 
     supabase_url: str | None = None
     supabase_anon_key: str | None = None

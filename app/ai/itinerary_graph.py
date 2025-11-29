@@ -12,6 +12,7 @@ from app.ai.openai_client import get_client
 from app.api.models.schemas import Activity, DayItinerary, Location, PlannerData
 from app.core.config import settings
 from app.external.crawl4ai_client import fetch_poi_snippets
+from app.external.google_places_api import search_places_for_planner
 from app.external.routes_api import compute_route_durations
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,26 @@ async def collect_pois(state: ItineraryState) -> Dict[str, Any]:
     planner = state["planner_data"]
     client = get_client()
     pois: List[Dict[str, Any]] = []
+
+    # 1) Google Places 기반 후보
+    try:
+        google_pois = await search_places_for_planner(planner)
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Google Places lookup failed: %s", exc)
+        google_pois = []
+
+    seen: set[str] = set()
+    for poi in google_pois:
+        name = poi.get("name")
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        pois.append(poi)
+
+    # 2) OpenAI로 추가 후보 확보 (필요 시)
     if client:
         try:
             system_prompt = (
@@ -80,11 +101,30 @@ async def collect_pois(state: ItineraryState) -> Dict[str, Any]:
                 response_format={"type": "json_object"},
             )
             payload = json.loads(response.choices[0].message.content)
-            pois = payload.get("pois", [])
+            llm_pois = payload.get("pois", [])
+            for poi in llm_pois:
+                name = poi.get("name")
+                if not name:
+                    continue
+                key = name.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                pois.append(poi)
         except Exception as exc:  # pragma: no cover - network dependent
             logger.warning("OpenAI POI collection failed, falling back to heuristic: %s", exc)
+
+    # 3) 부족할 경우 휴리스틱 보완
     if not pois:
         pois = _fallback_candidate_pois(planner)
+    elif len(pois) < 6:
+        for poi in _fallback_candidate_pois(planner):
+            name = poi.get("name")
+            if not name or name.casefold() in seen:
+                continue
+            seen.add(name.casefold())
+            pois.append(poi)
+
     return {"candidate_pois": pois}
 
 
