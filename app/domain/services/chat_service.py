@@ -22,7 +22,7 @@ class ChatService:
         if not chat_request.message.timestamp:
             chat_request.message.timestamp = datetime.utcnow()
 
-        reply, updated_entity = generate_chat_reply(itinerary, chat_request.message, chat_request.context)
+        reply, updated_entity = await generate_chat_reply(itinerary, chat_request.message, chat_request.context)
         if updated_entity:
             await self.repo.update(updated_entity)
         return ChatResponse(reply=reply, updatedItinerary=updated_entity.to_api_model() if updated_entity else None)

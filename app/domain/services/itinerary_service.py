@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from app.ai.itinerary_graph import _coords_for, generate_itinerary
 from app.api.models.schemas import Activity, ChatChange, DayItinerary, Location, PlannerData
+from app.core.errors import ValidationError
 from app.domain.models import ItineraryEntity
 from app.domain.repositories import ItineraryRepository
 from app.external.routes_api import compute_route_durations
@@ -43,17 +44,31 @@ class ItineraryService:
 
     def _validate_planner_data(self, planner_data: PlannerData) -> None:
         if not planner_data.country:
-            raise ValueError("country is required")
+            raise ValidationError("country is required", {"field": "plannerData.country", "reason": "필수 값입니다."})
         if not planner_data.dateRange or planner_data.dateRange.start > planner_data.dateRange.end:
-            raise ValueError("dateRange is invalid")
+            raise ValidationError(
+                "dateRange is invalid",
+                {"field": "plannerData.dateRange", "reason": "출발일과 도착일을 확인하세요."},
+            )
         if planner_data.dateRange.start < datetime.utcnow().date():
-            raise ValueError("start date must be today or later")
+            raise ValidationError(
+                "start date must be today or later",
+                {"field": "plannerData.dateRange.start", "reason": "출발일은 오늘 이후여야 합니다."},
+            )
         if planner_data.travelers.adults < 1:
-            raise ValueError("at least 1 adult is required")
+            raise ValidationError(
+                "at least 1 adult is required",
+                {"field": "plannerData.travelers.adults", "reason": "성인은 1명 이상이어야 합니다."},
+            )
         if not planner_data.styles:
-            raise ValueError("styles are required")
+            raise ValidationError(
+                "styles are required", {"field": "plannerData.styles", "reason": "최소 1개 이상의 스타일을 선택하세요."}
+            )
         if not planner_data.cities:
-            raise ValueError("at least one city is required")
+            raise ValidationError(
+                "at least one city is required",
+                {"field": "plannerData.cities", "reason": "최소 1개 도시를 입력하세요."},
+            )
 
     async def _apply_change_set(self, entity: ItineraryEntity, changes: List[ChatChange]) -> None:
         for change in changes:

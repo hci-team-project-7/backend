@@ -1,11 +1,20 @@
 from fastapi import Depends
 
 from app.core.config import settings
-from app.domain.repositories import InMemoryItineraryRepository, ItineraryRepository
+from app.domain.repositories import (
+    InMemoryItineraryRepository,
+    ItineraryRepository,
+    SupabaseItineraryRepository,
+)
 from app.domain.services.chat_service import ChatService
 from app.domain.services.itinerary_service import ItineraryService
+from app.external.supabase_client import get_supabase_client
 
-_repo = InMemoryItineraryRepository()
+_supabase_client = get_supabase_client()
+if settings.use_supabase and _supabase_client:
+    _repo: ItineraryRepository = SupabaseItineraryRepository(_supabase_client)
+else:
+    _repo = InMemoryItineraryRepository()
 
 
 def get_itinerary_repo() -> ItineraryRepository:

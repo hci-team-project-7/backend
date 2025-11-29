@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 
 from app.api.models.schemas import CreateItineraryRequest, CreateItineraryResponse, Itinerary
+from app.core.errors import NotFoundError, ValidationError
 from app.domain.services.itinerary_service import ItineraryService
 from app.dependencies import get_itinerary_service
 
@@ -13,8 +14,8 @@ async def create_itinerary(
 ):
     try:
         entity = await svc.create_itinerary(body.plannerData)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except ValidationError as exc:
+        raise exc
     return entity.to_api_model()
 
 
@@ -23,5 +24,5 @@ async def get_itinerary(itinerary_id: str, svc: ItineraryService = Depends(get_i
     try:
         entity = await svc.get_itinerary(itinerary_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail="Itinerary not found")
+        raise NotFoundError("Itinerary not found")
     return entity.to_api_model()

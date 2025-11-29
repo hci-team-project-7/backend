@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
 from app.api.models.schemas import ApplyPreviewRequest, ApplyPreviewResponse, ChatRequest, ChatResponse
+from app.core.errors import NotFoundError
 from app.domain.services.chat_service import ChatService
 from app.domain.services.itinerary_service import ItineraryService
 from app.dependencies import get_chat_service, get_itinerary_service
@@ -17,7 +18,7 @@ async def chat_with_itinerary(
     try:
         return await chat_svc.handle_chat(itinerary_id, body)
     except KeyError:
-        raise HTTPException(status_code=404, detail="Itinerary not found")
+        raise NotFoundError("Itinerary not found")
 
 
 @router.post("/{itinerary_id}/apply-preview", response_model=ApplyPreviewResponse)
@@ -29,7 +30,7 @@ async def apply_preview(
     try:
         entity = await svc.apply_changes(itinerary_id, body.changes)
     except KeyError:
-        raise HTTPException(status_code=404, detail="Itinerary not found")
+        raise NotFoundError("Itinerary not found")
 
     return ApplyPreviewResponse(
         updatedItinerary=entity.to_api_model(),
