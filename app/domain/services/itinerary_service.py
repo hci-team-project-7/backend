@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import re
 from typing import Dict, List
 from uuid import uuid4
 
 from app.ai.itinerary_graph import _coords_for, generate_itinerary
-from app.api.models.schemas import Activity, ChatChange, DayItinerary, Location, PlannerData
+from app.api.models.schemas import Activity, ChatChange, DayItinerary, Location, PlannerData, TransportLeg
 from app.core.errors import ValidationError
 from app.domain.models import ItineraryEntity
 from app.domain.repositories import ItineraryRepository
-from app.external.routes_api import compute_route_durations
+from app.external.routes_api import compute_route_segments
 
 
 class ItineraryService:
     def __init__(self, repo: ItineraryRepository):
         self.repo = repo
+        self._MODE_LABEL = {"drive": "자동차", "walk": "도보", "transit": "대중교통", "bike": "자전거"}
 
     async def create_itinerary(self, planner_data: PlannerData) -> ItineraryEntity:
         self._validate_planner_data(planner_data)
@@ -38,7 +40,6 @@ class ItineraryService:
     async def apply_changes(self, itinerary_id: str, changes: List[ChatChange]) -> ItineraryEntity:
         entity = await self.repo.get(itinerary_id)
         await self._apply_change_set(entity, changes)
-        await self._sync_overview(entity)
         await self.repo.update(entity)
         return entity
 
@@ -71,9 +72,16 @@ class ItineraryService:
             )
 
     async def _apply_change_set(self, entity: ItineraryEntity, changes: List[ChatChange]) -> None:
+        affected_days: set[str] = set()
+        day_modes: Dict[str, str] = {}
+        regenerated_days: set[str] = set()
+        day_segments: Dict[str, List[Dict[str, int | str]]] = {}
+        day_locations: Dict[str, List[Location]] = {}
+
         for change in changes:
             day = change.day or 1
             day_key = str(day)
+            affected_days.add(day_key)
             if day_key not in entity.activities_by_day:
                 entity.activities_by_day[day_key] = []
             activities = entity.activities_by_day[day_key]
@@ -86,27 +94,30 @@ class ItineraryService:
                 if not self._modify_activity(activities, change):
                     activities.append(self._build_new_activity(day, len(activities) + 1, change))
             elif change.action == "transport":
-                activities.append(
-                    Activity(
-                        id=f"{day}-{len(activities) + 1}",
-                        name="이동 경로 업데이트",
-                        location=change.location or "이동",
-                        time="12:00",
-                        duration="30분",
-                        description=change.details or "이동 수단을 조정했습니다.",
-                        image="/transport.jpg",
-                        openHours="항상",
-                        price="알 수 없음",
-                        tips=["이동 시간을 충분히 확보하세요."],
-                        nearbyFood=[],
-                        estimatedDuration="30분",
-                        bestTime="오전",
-                    )
-                )
+                mode = _detect_mode(change.mode, change.details)
+                day_modes[day_key] = mode
+            elif change.action == "regenerate":
+                await self._regenerate_day(entity, day)
+                regenerated_days.add(day_key)
 
-        # Recompute times and locations after all changes
-        for day_key, activities in entity.activities_by_day.items():
-            await self._recompute_day_schedule(day_key, activities)
+        # Recompute only affected days (skip regenerated days which already include timing)
+        for day_key in affected_days:
+            if day_key in regenerated_days:
+                continue
+            activities = entity.activities_by_day.get(day_key, [])
+            existing_mode = self._extract_current_mode(entity, day_key)
+            mode = day_modes.get(day_key, existing_mode or entity.planner_data.transportMode)
+            segments, locations = await self._recompute_day_schedule(entity, day_key, activities, mode)
+            day_segments[day_key] = segments
+            day_locations[day_key] = locations
+
+        await self._sync_overview(
+            entity,
+            affected_days=affected_days,
+            day_modes=day_modes,
+            segments_by_day=day_segments,
+            locations_by_day=day_locations,
+        )
 
     def _remove_activity(self, activities: List[Activity], location: str | None) -> None:
         if not location:
@@ -145,43 +156,123 @@ class ItineraryService:
             bestTime="오후",
         )
 
-    async def _recompute_day_schedule(self, day_key: str, activities: List[Activity]) -> None:
-        hour = 9
+    def _extract_current_mode(self, entity: ItineraryEntity, day_key: str) -> str | None:
+        for item in entity.overview:
+            if str(item.day) == day_key and item.transports:
+                return item.transports[0].mode
+        return None
+
+    def _location_coord_lookup(self, entity: ItineraryEntity, day_key: str) -> Dict[str, tuple[float, float]]:
+        existing = next((item for item in entity.overview if str(item.day) == day_key), None)
+        if not existing:
+            return {}
+        return {loc.name.casefold(): (loc.lat, loc.lng) for loc in existing.locations or []}
+
+    def _build_locations(
+        self, activities: List[Activity], coords_by_name: Dict[str, tuple[float, float]]
+    ) -> List[Location]:
         locations: List[Location] = []
         for act in activities:
-            act.time = f"{hour:02d}:00"
-            lat, lng = _coords_for(act.location)
-            locations.append(
-                Location(
-                    name=act.name,
-                    time=act.time,
-                    lat=lat,
-                    lng=lng,
-                )
-            )
-            hour += 2
-        if len(locations) > 1:
-            durations = await compute_route_durations(locations)
-            if durations:
-                current_minutes = 9 * 60
-                for idx, act in enumerate(activities):
-                    act.time = f"{current_minutes // 60:02d}:{current_minutes % 60:02d}"
-                    if idx < len(durations):
-                        current_minutes += durations[idx] + 60  # 1h dwell + travel
+            coords = coords_by_name.get(act.name.casefold())
+            if coords:
+                lat, lng = coords
+            else:
+                lat, lng = _coords_for(act.location)
+            locations.append(Location(name=act.name, time=act.time, lat=lat, lng=lng))
+        return locations
 
-    async def _sync_overview(self, entity: ItineraryEntity) -> None:
+    async def _recompute_day_schedule(
+        self, entity: ItineraryEntity, day_key: str, activities: List[Activity], mode: str | None = "drive"
+    ) -> tuple[List[Dict[str, int | str]], List[Location]]:
+        current_minutes = 8 * 60  # 08:00 시작
+        coords_by_name = self._location_coord_lookup(entity, day_key)
+        for act in activities:
+            act.time = f"{current_minutes // 60:02d}:{current_minutes % 60:02d}"
+            dwell = _duration_to_minutes(act.duration or act.estimatedDuration, 90)
+            current_minutes += dwell
+        routing_locations = self._build_locations(activities, coords_by_name)
+        segments: List[Dict[str, int | str]] = []
+        if len(routing_locations) > 1:
+            segments = await compute_route_segments(routing_locations, mode or "drive")
+            durations = [int(seg.get("durationMinutes", 0) or 0) for seg in segments]
+            current_minutes = 8 * 60
+            for idx, act in enumerate(activities):
+                act.time = f"{current_minutes // 60:02d}:{current_minutes % 60:02d}"
+                dwell = _duration_to_minutes(act.duration or act.estimatedDuration, 90)
+                travel = durations[idx] if idx < len(durations) else 0
+                current_minutes += dwell + travel
+        final_locations = self._build_locations(activities, coords_by_name)
+        return segments, final_locations
+
+    async def _regenerate_day(self, entity: ItineraryEntity, day: int) -> None:
+        """
+        Regenerate a specific day by re-running the itinerary generator and swapping that day only.
+        """
+        day_key = str(day)
+        overview, activities_by_day = await generate_itinerary(entity.planner_data)
+        if day_key not in activities_by_day:
+            return
+
+        entity.activities_by_day[day_key] = activities_by_day[day_key]
+        new_overview_by_day: Dict[str, DayItinerary] = {str(item.day): item for item in overview}
+        if day_key in new_overview_by_day:
+            replaced = False
+            for idx, item in enumerate(entity.overview):
+                if item.day == day:
+                    entity.overview[idx] = new_overview_by_day[day_key]
+                    replaced = True
+                    break
+            if not replaced:
+                entity.overview.append(new_overview_by_day[day_key])
+
+    async def _sync_overview(
+        self,
+        entity: ItineraryEntity,
+        affected_days: set[str] | None = None,
+        day_modes: Dict[str, str] | None = None,
+        segments_by_day: Dict[str, List[Dict[str, int | str]]] | None = None,
+        locations_by_day: Dict[str, List[Location]] | None = None,
+    ) -> None:
         overview_by_day: Dict[str, DayItinerary] = {
             str(item.day): item for item in entity.overview
         }
-        for day_key, activities in entity.activities_by_day.items():
-            locations = [
-                Location(name=act.name, time=act.time, lat=_coords_for(act.location)[0], lng=_coords_for(act.location)[1])
-                for act in activities
-            ]
+        all_days = set(entity.activities_by_day.keys()) | set(overview_by_day.keys())
+        mode_overrides = day_modes or {}
+        for day_key in all_days:
+            if affected_days is not None and day_key not in affected_days:
+                continue
+            activities = entity.activities_by_day.get(day_key, [])
+            coords_by_name = self._location_coord_lookup(entity, day_key)
+            locations = locations_by_day.get(day_key) if locations_by_day else None
+            if locations is None:
+                locations = self._build_locations(activities, coords_by_name)
+            mode = mode_overrides.get(day_key, entity.planner_data.transportMode or "drive")
+            segments = segments_by_day.get(day_key) if segments_by_day is not None else None
+            if segments is None and len(locations) > 1:
+                segments = await compute_route_segments(locations, mode or "drive")
+            segments = segments or []
+            transports: List[TransportLeg] = []
+            for idx, seg in enumerate(segments):
+                if idx >= len(activities) - 1:
+                    break
+                travel = int(seg.get("durationMinutes", 0) or 0)
+                distance = int(seg.get("distanceMeters", 0) or 0)
+                seg_mode = str(seg.get("mode", mode or "drive")) if isinstance(seg, dict) else (mode or "drive")
+                transports.append(
+                    TransportLeg(
+                        fromActivityId=activities[idx].id,
+                        toActivityId=activities[idx + 1].id,
+                        mode=seg_mode,
+                        durationMinutes=travel,
+                        distanceMeters=distance,
+                        summary=f"{self._MODE_LABEL.get(seg_mode, '이동')} 이동 {travel}분",
+                    )
+                )
             if day_key in overview_by_day:
                 item = overview_by_day[day_key]
                 item.activities = [act.name for act in activities]
                 item.locations = locations
+                item.transports = transports
             else:
                 day = int(day_key)
                 date = entity.planner_data.dateRange.start + timedelta(days=day - 1)
@@ -192,5 +283,59 @@ class ItineraryService:
                     photo="/city-arrival.jpg",
                     activities=[act.name for act in activities],
                     locations=locations,
+                    transports=transports,
                 )
         entity.overview = [overview_by_day[key] for key in sorted(overview_by_day.keys(), key=int)]
+
+
+def _duration_to_minutes(text: str | None, default: int = 60) -> int:
+    if not text:
+        return default
+    try:
+        lowered = text.lower()
+    except Exception:
+        return default
+    hours = 0
+    minutes = 0
+    try:
+        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*(시간|hour|hr|h)", lowered)
+        if hour_match:
+            hours = float(hour_match.group(1))
+        minute_match = re.search(r"(\d+)\s*(분|minute|min)", lowered)
+        if minute_match:
+            minutes = int(minute_match.group(1))
+        if not hour_match and not minute_match:
+            number_match = re.search(r"(\d+(?:\.\d+)?)", lowered)
+            if number_match:
+                minutes = float(number_match.group(1))
+                if minutes <= 8:
+                    hours = minutes
+                    minutes = 0
+        total = int(hours * 60 + minutes)
+        return total if total > 0 else default
+    except Exception:
+        return default
+
+
+def _detect_mode(mode: str | None, details: str | None) -> str:
+    if mode:
+        return str(mode)
+    if not details:
+        return "drive"
+    lowered = details.lower()
+    if "walk" in lowered or "도보" in lowered:
+        return "walk"
+    if "bike" in lowered or "자전거" in lowered:
+        return "bike"
+    if (
+        "bus" in lowered
+        or "버스" in lowered
+        or "지하철" in lowered
+        or "전철" in lowered
+        or "metro" in lowered
+        or "트램" in lowered
+        or "transit" in lowered
+        or "대중" in lowered
+    ):
+        return "transit"
+    return "drive"

@@ -26,6 +26,7 @@ class PlannerData(BaseModel):
     dateRange: DateRange
     travelers: Travelers
     styles: List[str]
+    transportMode: Optional["TransportMode"] = "drive"
 
 
 # ---------- Location / DayItinerary / Activity ----------
@@ -45,6 +46,7 @@ class DayItinerary(BaseModel):
     photo: str
     activities: List[str]
     locations: List[Location]
+    transports: List["TransportLeg"] = Field(default_factory=list)
 
 
 class Activity(BaseModel):
@@ -61,6 +63,18 @@ class Activity(BaseModel):
     nearbyFood: List[str]
     estimatedDuration: str
     bestTime: str
+
+
+TransportMode = Literal["drive", "walk", "transit", "bike"]
+
+
+class TransportLeg(BaseModel):
+    fromActivityId: str
+    toActivityId: str
+    mode: TransportMode = "drive"
+    durationMinutes: int
+    distanceMeters: int
+    summary: str
 
 
 # ---------- Itinerary ----------
@@ -82,10 +96,11 @@ ChatSender = Literal["user", "assistant"]
 
 
 class ChatChange(BaseModel):
-    action: Literal["add", "remove", "modify", "transport"]
+    action: Literal["add", "remove", "modify", "transport", "regenerate"]
     day: Optional[int] = None
     location: Optional[str] = None
     details: Optional[str] = None
+    mode: Optional["TransportMode"] = None
 
 
 class ChatRestaurantRecommendation(BaseModel):
@@ -153,3 +168,9 @@ class ApplyPreviewRequest(BaseModel):
 class ApplyPreviewResponse(BaseModel):
     updatedItinerary: Itinerary
     systemMessage: str
+
+
+# Resolve forward references
+PlannerData.model_rebuild()
+DayItinerary.model_rebuild()
+Itinerary.model_rebuild()
