@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from math import atan2, cos, radians, sin, sqrt
 import re
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 from uuid import uuid4
@@ -13,6 +14,8 @@ from app.ai.openai_client import get_client
 from app.api.models.schemas import Activity, ChatChange, ChatContext, ChatMessage, ChatPreview, ChatReply, DayItinerary, PlannerData
 from app.core.config import settings
 from app.domain.models import ItineraryEntity
+from app.external.google_places_api import search_restaurants_near
+from app.ai.itinerary_graph import _coords_for
 
 logger = logging.getLogger(__name__)
 
@@ -38,14 +41,18 @@ def _fallback_change_preview(day: int, activities: List[Activity]) -> ChatPrevie
     return ChatPreview(type="change", title=f"{day}일차 일정 조정 제안", changes=changes)
 
 
-def _fallback_transport_preview(day: int, mode: str) -> ChatPreview:
+def _fallback_transport_preview(day: int, mode: str, from_loc: Optional[str] = None, to_loc: Optional[str] = None) -> ChatPreview:
     readable = {"walk": "도보", "transit": "대중교통", "bike": "자전거", "drive": "자동차"}.get(mode, "자동차")
+    location_label = f"{from_loc} → {to_loc}" if from_loc and to_loc else "이동 경로"
+    details = f"{location_label}을 {readable} 이동으로 변경" if from_loc and to_loc else f"{readable} 이동으로 변경"
     change = ChatChange(
         action="transport",
         day=day,
-        location="이동 경로",
-        details=f"{readable} 이동으로 변경",
+        location=location_label,
+        details=details,
         mode=mode,  # type: ignore[arg-type]
+        fromLocation=from_loc,
+        toLocation=to_loc,
     )
     return ChatPreview(type="change", title=f"{day}일차 교통 수단 변경", changes=[change])
 
@@ -105,6 +112,78 @@ def _choose_fallback_activity(activities: List[Activity]) -> Optional[Activity]:
     return activities[0] if activities else None
 
 
+def _lookup_activity_coords(overview: List[DayItinerary], day: int, name: str | None) -> Optional[Tuple[float, float]]:
+    if not name:
+        return None
+    target = name.casefold()
+    for item in overview:
+        if item.day != day:
+            continue
+        for loc in item.locations or []:
+            if target in loc.name.casefold():
+                return loc.lat, loc.lng
+    return None
+
+
+def _haversine_distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> int:
+    r = 6371000
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lng2 - lng1)
+    a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return int(r * c)
+
+
+def _extract_segment_targets(
+    message_text: str, activities_by_day: Dict[str, List[Activity]], default_day: int
+) -> Tuple[Optional[str], Optional[str]]:
+    lowered = message_text.casefold()
+    day_key = str(default_day)
+    acts = activities_by_day.get(day_key, [])
+    candidates: List[Tuple[int, str]] = []
+    for idx, act in enumerate(acts):
+        name_lower = (act.name or "").casefold()
+        loc_lower = (act.location or "").casefold()
+        if name_lower and name_lower in lowered:
+            candidates.append((idx, act.name))
+            continue
+        if loc_lower and loc_lower in lowered:
+            candidates.append((idx, act.name))
+    if len(candidates) < 2:
+        return None, None
+    candidates = sorted(candidates, key=lambda x: x[0])
+    for i in range(len(candidates) - 1):
+        if candidates[i + 1][0] - candidates[i][0] == 1:
+            return candidates[i][1], candidates[i + 1][1]
+    return candidates[0][1], candidates[1][1]
+
+
+def _is_question_like(text: str) -> bool:
+    """
+    Heuristic to detect informational questions (e.g., '~이 뭐야?', '알려줘') to avoid forcing change previews.
+    """
+    lowered = text.lower()
+    change_keywords = [
+        "추가",
+        "더해",
+        "빼",
+        "제거",
+        "삭제",
+        "없애",
+        "교체",
+        "변경",
+        "바꿔",
+        "재생성",
+        "추천",
+    ]
+    if any(keyword in lowered for keyword in change_keywords):
+        return False
+    question_mark = "?" in text
+    question_keywords = ["뭐야", "알려", "설명", "어때", "어떤가", "궁금", "어디", "how", "what", "tell me"]
+    return question_mark or any(keyword in lowered for keyword in question_keywords)
+
+
 def _classify_intent(message: ChatMessage, context: ChatContext) -> Tuple[str, int]:
     text_lower = message.text.lower()
     day = _extract_day_from_text(message.text, context.currentDay or 1)
@@ -113,11 +192,19 @@ def _classify_intent(message: ChatMessage, context: ChatContext) -> Tuple[str, i
     transport_keywords = ["교통", "이동", "버스", "subway", "지하철", "대중", "transit", "metro", "트램"]
     restaurant_keywords = ["맛집", "식당", "레스토랑", "restaurant", "먹을", "카페"]
 
+    if context.pendingAction in {"remove", "add"}:
+        return "activity_change", day
+    if context.pendingAction == "restaurant":
+        return "restaurant", day
+    if context.pendingAction == "transport":
+        return "transport", day
     if any(kw in text_lower for kw in regen_keywords):
         return "regenerate", day
-    if context.pendingAction == "restaurant" or any(kw in text_lower for kw in restaurant_keywords):
+    if _is_question_like(message.text):
+        return "question", day
+    if any(kw in text_lower for kw in restaurant_keywords):
         return "restaurant", day
-    if context.pendingAction == "transport" or any(kw in text_lower for kw in transport_keywords):
+    if any(kw in text_lower for kw in transport_keywords):
         return "transport", day
     return "activity_change", day
 
@@ -129,7 +216,9 @@ async def _llm_classify_intent(message: ChatMessage, context: ChatContext, plann
     try:
         schema_prompt = (
             "Return JSON with keys 'intent' and 'day'. "
-            "intent should be one of ['transport','restaurant','regenerate','activity_change']. "
+            "intent should be one of ['transport','restaurant','regenerate','activity_change','question']. "
+            "Use 'question' only when the user is asking for information/clarification without requesting a change. "
+            "Honor pending actions strongly: 'restaurant' -> restaurant, 'transport' -> transport, 'remove/add' -> activity_change. "
             "day should be a positive integer if mentioned, otherwise null. "
             "Use the provided context to infer the day if the user references a day."
         )
@@ -147,7 +236,7 @@ async def _llm_classify_intent(message: ChatMessage, context: ChatContext, plann
         payload = json.loads(resp.choices[0].message.content)
         intent = payload.get("intent")
         day = payload.get("day")
-        if intent not in {"transport", "restaurant", "regenerate", "activity_change"}:
+        if intent not in {"transport", "restaurant", "regenerate", "activity_change", "question"}:
             intent = None
         day_int: Optional[int] = None
         if isinstance(day, int) and day > 0:
@@ -174,8 +263,24 @@ def _build_rule_based_preview(
             type="recommendation",
             title=f"{city} 맛집 추천",
             recommendations=[
-                {"name": f"{city} 로컬 레스토랑 A", "location": f"{city} 시내", "rating": 4.6, "cuisine": "local"},
-                {"name": f"{city} 인기 카페", "location": f"{city} 중심가", "rating": 4.5, "cuisine": "cafe"},
+                {
+                    "name": f"{city} 로컬 레스토랑 A",
+                    "location": f"{city} 시내",
+                    "rating": 4.6,
+                    "cuisine": "local",
+                    "userRatingsTotal": 120,
+                    "isDemo": True,
+                    "source": "demo",
+                },
+                {
+                    "name": f"{city} 인기 카페",
+                    "location": f"{city} 중심가",
+                    "rating": 4.5,
+                    "cuisine": "cafe",
+                    "userRatingsTotal": 80,
+                    "isDemo": True,
+                    "source": "demo",
+                },
             ],
         )
         return preview, f"{city} 주변에서 시도해볼 만한 맛집을 추천했어요."
@@ -183,7 +288,8 @@ def _build_rule_based_preview(
     transport_keywords = ["교통", "이동", "버스", "subway", "지하철", "대중", "transit", "metro", "트램"]
     if context.pendingAction == "transport" or any(keyword in text_lower for keyword in transport_keywords):
         mode = _detect_mode_from_text(message.text)
-        preview = _fallback_transport_preview(day, mode)
+        seg_from, seg_to = _extract_segment_targets(message.text, activities_by_day, day)
+        preview = _fallback_transport_preview(day, mode, seg_from, seg_to)
         details = preview.changes[0].details if preview.changes else "이동을 변경"
         return preview, f"{day}일차 이동 수단을 {details}로 적용할까요?"
 
@@ -240,6 +346,8 @@ async def classify_intent(state: ChatState) -> Dict[str, Any]:
     context = state["context"]
     planner = state["planner_data"]
     intent, day = await _llm_classify_intent(message, context, planner)
+    if context.pendingAction in {"remove", "add"} and intent in {None, "regenerate"}:
+        intent = "activity_change"
     if not intent:
         intent, day = _classify_intent(message, context)
     return {"intent": intent, "target_day": day}
@@ -253,7 +361,30 @@ def _route_after_classify(state: ChatState) -> str:
         return "restaurant"
     if intent == "regenerate":
         return "regenerate"
+    if intent == "question":
+        return "question"
     return "activity_change"
+
+
+def _summarize_day(
+    day: int, planner: PlannerData, overview: List[DayItinerary], activities_by_day: Dict[str, List[Activity]]
+) -> str:
+    activities = activities_by_day.get(str(day), [])
+    if not activities:
+        return f"{day}일차 일정 정보를 찾지 못했어요. 다른 날짜를 알려주시면 일정 내용을 설명해 드릴게요."
+
+    mode_label = {"drive": "자동차", "walk": "도보", "transit": "대중교통", "bike": "자전거"}
+    overview_item = next((item for item in overview if item.day == day), None)
+    transport_mode = None
+    if overview_item and overview_item.transports:
+        transport_mode = overview_item.transports[0].mode
+    transport_readable = mode_label.get(transport_mode or planner.transportMode or "drive", "자동차")
+    activity_lines = "\n".join([f"- {act.time} {act.name}" if act.time else f"- {act.name}" for act in activities])
+    return (
+        f"{day}일차에는 총 {len(activities)}개의 일정이 있어요.\n"
+        f"{activity_lines}\n"
+        f"현재 이동 수단은 {transport_readable} 기준으로 안내 중이에요."
+    )
 
 
 async def _llm_plan(
@@ -272,6 +403,9 @@ async def _llm_plan(
             "changes (list of {action, day, location, details, mode}) or "
             "recommendations (list of {name, location, rating, cuisine}). "
             "Allowed actions include add/remove/modify/transport/regenerate. "
+            "For 'add', you may set afterActivityName to place the new activity after a specific one. "
+            "For 'transport', you may set fromLocation and toLocation to target a single segment. "
+            "If the user is only asking for information, set preview to null and provide an informative Korean answer in 'text'. "
             "All text should be in Korean; translate any English context into natural Korean while "
             "keeping place/restaurant names readable."
         )
@@ -306,7 +440,8 @@ async def plan_transport(state: ChatState) -> Dict[str, Any]:
     message = state["last_user_message"]
     day = state.get("target_day") or (state["context"].currentDay or 1)
     mode = _detect_mode_from_text(message.text)
-    preview = _fallback_transport_preview(day, mode)
+    seg_from, seg_to = _extract_segment_targets(message.text, state["activities_by_day"], day)
+    preview = _fallback_transport_preview(day, mode, seg_from, seg_to)
     details = preview.changes[0].details if preview.changes else "이동을 변경"
     reply = ChatReply(
         id=f"msg_{uuid4().hex[:10]}",
@@ -318,16 +453,89 @@ async def plan_transport(state: ChatState) -> Dict[str, Any]:
     return {"assistant_reply": reply}
 
 
+async def plan_question(state: ChatState) -> Dict[str, Any]:
+    planner = state["planner_data"]
+    message = state["last_user_message"]
+    context = state["context"]
+    day = state.get("target_day") or _extract_day_from_text(message.text, context.currentDay or 1)
+    reply_text = _summarize_day(day, planner, state["itinerary_overview"], state["activities_by_day"])
+    reply = ChatReply(
+        id=f"msg_{uuid4().hex[:10]}",
+        text=reply_text,
+        sender="assistant",
+        timestamp=datetime.utcnow(),
+        preview=None,
+    )
+    return {"assistant_reply": reply}
+
+
 async def plan_restaurant(state: ChatState) -> Dict[str, Any]:
     planner = state["planner_data"]
     message = state["last_user_message"]
     context = state["context"]
     activities_by_day = state["activities_by_day"]
     day = state.get("target_day") or (context.currentDay or 1)
-    preview, reply_text = _build_rule_based_preview(message, context, planner, activities_by_day)
+    target_day, anchor_act = _find_activity_match(activities_by_day, message.text, day)
+    target_day = target_day or day
+    anchor = anchor_act or _choose_fallback_activity(activities_by_day.get(str(target_day), []))
+    anchor_name = anchor.name if anchor else planner.cities[0] if planner.cities else planner.country
+    city = planner.cities[0] if planner.cities else planner.country
+
+    anchor_coords = _lookup_activity_coords(state["itinerary_overview"], target_day, anchor_name) or _coords_for(
+        anchor_name
+    )
+
+    recommendations = []
+    if anchor_coords:
+        lat, lng = anchor_coords
+        places = await search_restaurants_near(anchor_name, lat, lng, radius_m=2500, max_results=6)
+        for place in places:
+            name = (place.get("displayName") or {}).get("text") or place.get("name")
+            if not name:
+                continue
+            location_label = place.get("formattedAddress") or place.get("location", {}).get("formattedAddress") or city
+            place_loc = place.get("location", {}) or {}
+            plat = place_loc.get("latitude")
+            plng = place_loc.get("longitude")
+            dist = None
+            if plat is not None and plng is not None and lat is not None and lng is not None:
+                dist = _haversine_distance_m(lat, lng, float(plat), float(plng))
+            walking_minutes = int(dist / 80) if dist is not None else None  # ~4.8km/h
+            driving_minutes = int(dist / 600) if dist is not None else None  # ~36km/h 도심 근사치
+            recommendations.append(
+                {
+                    "name": name,
+                    "location": location_label,
+                    "address": location_label,
+                    "rating": place.get("rating"),
+                    "userRatingsTotal": place.get("userRatingCount"),
+                    "cuisine": place.get("primaryType") or (place.get("types") or [None])[0],
+                    "lat": plat,
+                    "lng": plng,
+                    "distanceMeters": dist,
+                    "anchorActivityName": anchor_name,
+                    "walkingMinutes": walking_minutes,
+                    "drivingMinutes": driving_minutes,
+                    "source": "google_places",
+                }
+            )
+
+    if not recommendations:
+        preview, reply_text = _build_rule_based_preview(message, context, planner, activities_by_day)
+        reply = ChatReply(
+            id=f"msg_{uuid4().hex[:10]}",
+            text=reply_text or "근처 맛집을 추천했어요. 마음에 드는 곳을 선택해 주세요.",
+            sender="assistant",
+            timestamp=datetime.utcnow(),
+            preview=preview,
+        )
+        return {"assistant_reply": reply}
+
+    title = f"{anchor_name} 근처 맛집 추천"
+    preview = ChatPreview(type="recommendation", title=title, recommendations=recommendations)
     reply = ChatReply(
         id=f"msg_{uuid4().hex[:10]}",
-        text=reply_text or "근처 맛집을 추천했어요. 마음에 드는 곳을 선택해 주세요.",
+        text=f"{anchor_name} 주변에서 가볼 만한 장소를 골라봤어요. 마음에 드는 곳을 선택하면 일정에 바로 반영할게요.",
         sender="assistant",
         timestamp=datetime.utcnow(),
         preview=preview,
@@ -366,10 +574,24 @@ async def plan_activity(state: ChatState) -> Dict[str, Any]:
     activities_by_day = state["activities_by_day"]
     day = state.get("target_day") or (context.currentDay or 1)
 
+    if state.get("intent") == "question" or (_is_question_like(message.text) and context.pendingAction is None):
+        reply_text = _summarize_day(day, planner, state["itinerary_overview"], activities_by_day)
+        reply = ChatReply(
+            id=f"msg_{uuid4().hex[:10]}",
+            text=reply_text,
+            sender="assistant",
+            timestamp=datetime.utcnow(),
+            preview=None,
+        )
+        return {"assistant_reply": reply}
+
     preview, reply_text = await _llm_plan(planner, message, context, activities_by_day, day)
     if preview is None:
-        preview, fallback_reply = _build_rule_based_preview(message, context, planner, activities_by_day)
-        reply_text = reply_text or fallback_reply
+        if _is_question_like(message.text) and context.pendingAction is None:
+            reply_text = reply_text or _summarize_day(day, planner, state["itinerary_overview"], activities_by_day)
+        else:
+            preview, fallback_reply = _build_rule_based_preview(message, context, planner, activities_by_day)
+            reply_text = reply_text or fallback_reply
 
     reply = ChatReply(
         id=f"msg_{uuid4().hex[:10]}",
@@ -385,12 +607,14 @@ def build_chat_graph():
     builder = StateGraph(ChatState)
     builder.add_node("classify_intent", classify_intent)
     builder.add_node("plan_transport", plan_transport)
+    builder.add_node("plan_question", plan_question)
     builder.add_node("plan_restaurant", plan_restaurant)
     builder.add_node("plan_regenerate", plan_regenerate)
     builder.add_node("plan_activity", plan_activity)
     builder.set_entry_point("classify_intent")
-    builder.add_conditional_edges("classify_intent", _route_after_classify, {"transport": "plan_transport", "restaurant": "plan_restaurant", "regenerate": "plan_regenerate", "activity_change": "plan_activity"})
+    builder.add_conditional_edges("classify_intent", _route_after_classify, {"transport": "plan_transport", "restaurant": "plan_restaurant", "regenerate": "plan_regenerate", "question": "plan_question", "activity_change": "plan_activity"})
     builder.add_edge("plan_transport", END)
+    builder.add_edge("plan_question", END)
     builder.add_edge("plan_restaurant", END)
     builder.add_edge("plan_regenerate", END)
     builder.add_edge("plan_activity", END)

@@ -28,11 +28,11 @@ async def apply_preview(
     svc: ItineraryService = Depends(get_itinerary_service),
 ):
     try:
-        entity = await svc.apply_changes(itinerary_id, body.changes)
+        entity, summary = await svc.apply_changes(itinerary_id, body.changes)
     except KeyError:
         raise NotFoundError("Itinerary not found")
 
     return ApplyPreviewResponse(
         updatedItinerary=entity.to_api_model(),
-        systemMessage="선택하신 변경사항을 일정에 반영했습니다.",
+        systemMessage=summary or "선택하신 변경사항을 일정에 반영했습니다.",
     )

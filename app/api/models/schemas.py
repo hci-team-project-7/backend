@@ -53,6 +53,8 @@ class Activity(BaseModel):
     id: str
     name: str
     location: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
     time: str
     duration: str
     description: str
@@ -101,6 +103,12 @@ class ChatChange(BaseModel):
     location: Optional[str] = None
     details: Optional[str] = None
     mode: Optional["TransportMode"] = None
+    afterActivityName: Optional[str] = None
+    fromLocation: Optional[str] = None
+    toLocation: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    address: Optional[str] = None
 
 
 class ChatRestaurantRecommendation(BaseModel):
@@ -108,6 +116,16 @@ class ChatRestaurantRecommendation(BaseModel):
     location: str
     rating: Optional[float] = None
     cuisine: Optional[str] = None
+    address: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    distanceMeters: Optional[int] = None
+    anchorActivityName: Optional[str] = None
+    userRatingsTotal: Optional[int] = None
+    source: Optional[str] = None
+    isDemo: Optional[bool] = None
+    walkingMinutes: Optional[int] = None
+    drivingMinutes: Optional[int] = None
 
 
 class ChatPreview(BaseModel):

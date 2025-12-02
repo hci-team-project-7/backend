@@ -36,7 +36,9 @@ def _normalize_travel_mode(mode: str | TravelMode | None) -> tuple[TravelMode, s
     return "DRIVE", "drive"
 
 
-async def compute_route_segments(locations: List[Location], mode: str | TravelMode = "DRIVE") -> List[Dict[str, int | str]]:
+async def compute_route_segments(
+    locations: List[Location], mode: str | TravelMode = "DRIVE", modes_by_index: List[str] | None = None
+) -> List[Dict[str, int | str]]:
     """
     Google Routes API adapter.
     Returns a list of segments between successive locations with duration/distance.
@@ -46,10 +48,15 @@ async def compute_route_segments(locations: List[Location], mode: str | TravelMo
         return []
 
     if not settings.google_routes_api_key:
-        return [
-            {"mode": mode.lower(), "durationMinutes": 30, "distanceMeters": 2000}
-            for _ in range(len(locations) - 1)
-        ]
+        fallback_segments = []
+        for idx in range(len(locations) - 1):
+            seg_mode = mode
+            if modes_by_index and idx < len(modes_by_index) and modes_by_index[idx]:
+                seg_mode = modes_by_index[idx]
+            fallback_segments.append(
+                {"mode": str(seg_mode).lower(), "durationMinutes": 30, "distanceMeters": 2000}
+            )
+        return fallback_segments
 
     travel_mode, display_mode = _normalize_travel_mode(mode)
     url = "https://routes.googleapis.com/directions/v2:computeRoutes"
@@ -60,7 +67,11 @@ async def compute_route_segments(locations: List[Location], mode: str | TravelMo
 
     segments: List[Dict[str, int | str]] = []
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for origin, dest in zip(locations[:-1], locations[1:]):
+        for idx, (origin, dest) in enumerate(zip(locations[:-1], locations[1:])):
+            mode_override = None
+            if modes_by_index and idx < len(modes_by_index):
+                mode_override = modes_by_index[idx]
+            seg_travel_mode, seg_display_mode = _normalize_travel_mode(mode_override or mode)
             body = {
                 "origin": {
                     "location": {"latLng": {"latitude": origin.lat, "longitude": origin.lng}},
@@ -68,7 +79,7 @@ async def compute_route_segments(locations: List[Location], mode: str | TravelMo
                 "destination": {
                     "location": {"latLng": {"latitude": dest.lat, "longitude": dest.lng}},
                 },
-                "travelMode": travel_mode,
+                "travelMode": seg_travel_mode,
             }
             try:
                 resp = await client.post(url, headers=headers, json=body)
@@ -91,11 +102,11 @@ async def compute_route_segments(locations: List[Location], mode: str | TravelMo
                 minutes = min(minutes, MAX_TRAVEL_MINUTES)
                 distance = int(routes[0].get("distanceMeters", 0))
                 segments.append(
-                    {"mode": display_mode, "durationMinutes": minutes, "distanceMeters": max(0, distance)}
+                    {"mode": seg_display_mode, "durationMinutes": minutes, "distanceMeters": max(0, distance)}
                 )
             except Exception as exc:  # pragma: no cover - network errors handled gracefully
                 logger.warning("Failed to compute route %s -> %s: %s", origin.name, dest.name, exc)
-                segments.append({"mode": display_mode, "durationMinutes": 30, "distanceMeters": 2000})
+                segments.append({"mode": seg_display_mode, "durationMinutes": 30, "distanceMeters": 2000})
     return segments
 
 

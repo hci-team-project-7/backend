@@ -52,6 +52,46 @@ async def _search_places(query: str, max_results: int = 8) -> List[Dict[str, Any
         return []
 
 
+async def search_restaurants_near(
+    anchor_name: str,
+    lat: float,
+    lng: float,
+    radius_m: int = 2000,
+    max_results: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Location-biased restaurant search around a given coordinate using Google Places Text Search.
+    Falls back to an empty list when API key is missing or errors occur.
+    """
+    if not settings.google_places_api_key:
+        return []
+
+    headers = {
+        "X-Goog-Api-Key": settings.google_places_api_key,
+        "X-Goog-FieldMask": PLACES_FIELD_MASK,
+    }
+    payload = {
+        "textQuery": f"{anchor_name} 근처 맛집",
+        "pageSize": max_results,
+        "languageCode": "ko",
+        "locationBias": {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lng},
+                "radius": radius_m,
+            }
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(PLACES_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("places", [])
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Google Places nearby search failed for '%s': %s", anchor_name, exc)
+        return []
+
+
 def _normalize_place(place: Dict[str, Any], city: str, style: str) -> Dict[str, Any] | None:
     name = place.get("displayName", {}).get("text") or place.get("name")
     if not name:

@@ -197,6 +197,8 @@ async def schedule_days(state: ItineraryState) -> Dict[str, Any]:
             id=f"{day}-{slot}",
             name=name,
             location=city,
+            lat=lat,
+            lng=lng,
             time="00:00",  # 초기값, 이후 enrich_with_routes에서 실제 시간 재계산
             duration=f"{duration_min}분",
             description=description,
@@ -211,10 +213,13 @@ async def schedule_days(state: ItineraryState) -> Dict[str, Any]:
         return activity, (lat, lng)
 
     def _meal_activity(day: int, slot: int, city: str, label: str, duration_min: int, best_time: str) -> Activity:
+        lat, lng = _coords_for(city)
         return Activity(
             id=f"{day}-{slot}",
             name=f"{label} - {city}",
             location=city,
+            lat=lat,
+            lng=lng,
             time="00:00",
             duration=f"{duration_min}분",
             description=f"{city}에서 즐기는 {label.lower()} 시간입니다.",
@@ -228,10 +233,13 @@ async def schedule_days(state: ItineraryState) -> Dict[str, Any]:
         )
 
     def _cafe_break_activity(day: int, slot: int, city: str) -> Activity:
+        lat, lng = _coords_for(city)
         return Activity(
             id=f"{day}-{slot}",
             name=f"{city} 카페 휴식",
             location=city,
+            lat=lat,
+            lng=lng,
             time="00:00",
             duration="60분",
             description=f"{city}에서 여유롭게 커피 한 잔하며 쉬어가는 시간입니다.",

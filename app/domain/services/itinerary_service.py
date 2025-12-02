@@ -37,11 +37,12 @@ class ItineraryService:
     async def get_itinerary(self, itinerary_id: str) -> ItineraryEntity:
         return await self.repo.get(itinerary_id)
 
-    async def apply_changes(self, itinerary_id: str, changes: List[ChatChange]) -> ItineraryEntity:
+    async def apply_changes(self, itinerary_id: str, changes: List[ChatChange]) -> tuple[ItineraryEntity, str]:
         entity = await self.repo.get(itinerary_id)
+        summary = self._summarize_changes(changes)
         await self._apply_change_set(entity, changes)
         await self.repo.update(entity)
-        return entity
+        return entity, summary
 
     def _validate_planner_data(self, planner_data: PlannerData) -> None:
         if not planner_data.country:
@@ -77,6 +78,7 @@ class ItineraryService:
         regenerated_days: set[str] = set()
         day_segments: Dict[str, List[Dict[str, int | str]]] = {}
         day_locations: Dict[str, List[Location]] = {}
+        segment_mode_overrides: Dict[str, Dict[int, str]] = {}
 
         for change in changes:
             day = change.day or 1
@@ -85,20 +87,40 @@ class ItineraryService:
             if day_key not in entity.activities_by_day:
                 entity.activities_by_day[day_key] = []
             activities = entity.activities_by_day[day_key]
+            mutated = False
 
             if change.action == "remove":
                 self._remove_activity(activities, change.location)
+                mutated = True
             elif change.action == "add":
-                activities.append(self._build_new_activity(day, len(activities) + 1, change))
+                insert_at = self._find_insert_position(activities, change)
+                new_activity = self._build_new_activity(day, len(activities) + 1, change)
+                if insert_at is not None and 0 <= insert_at <= len(activities):
+                    activities.insert(insert_at, new_activity)
+                else:
+                    activities.append(new_activity)
+                mutated = True
             elif change.action == "modify":
-                if not self._modify_activity(activities, change):
+                if self._modify_activity(activities, change):
+                    mutated = True
+                else:
                     activities.append(self._build_new_activity(day, len(activities) + 1, change))
+                    mutated = True
             elif change.action == "transport":
                 mode = _detect_mode(change.mode, change.details)
-                day_modes[day_key] = mode
+                if change.fromLocation or change.toLocation:
+                    seg_idx = self._find_segment_index(activities, change.fromLocation, change.toLocation)
+                    if seg_idx is not None:
+                        segment_mode_overrides.setdefault(day_key, {})[seg_idx] = mode
+                    else:
+                        day_modes[day_key] = mode
+                else:
+                    day_modes[day_key] = mode
             elif change.action == "regenerate":
                 await self._regenerate_day(entity, day)
                 regenerated_days.add(day_key)
+            if mutated:
+                self._reindex_day_activities(day, activities)
 
         # Recompute only affected days (skip regenerated days which already include timing)
         for day_key in affected_days:
@@ -107,7 +129,10 @@ class ItineraryService:
             activities = entity.activities_by_day.get(day_key, [])
             existing_mode = self._extract_current_mode(entity, day_key)
             mode = day_modes.get(day_key, existing_mode or entity.planner_data.transportMode)
-            segments, locations = await self._recompute_day_schedule(entity, day_key, activities, mode)
+            seg_overrides = segment_mode_overrides.get(day_key)
+            segments, locations = await self._recompute_day_schedule(
+                entity, day_key, activities, mode, seg_overrides
+            )
             day_segments[day_key] = segments
             day_locations[day_key] = locations
 
@@ -138,15 +163,56 @@ class ItineraryService:
                 return True
         return False
 
+    def _find_insert_position(self, activities: List[Activity], change: ChatChange) -> int | None:
+        """
+        Try to place a newly added activity right after a related one (e.g., '신주쿠 교엔 방문 후 추가됨').
+        """
+        if change.afterActivityName:
+            anchor_lower = change.afterActivityName.casefold()
+            for idx, act in enumerate(activities):
+                if anchor_lower in act.name.casefold() or anchor_lower in act.location.casefold():
+                    return idx + 1
+        anchors: List[str] = []
+        if change.details:
+            anchors.append(change.details)
+            match = re.search(r"(.+?)(?:을|를)?\s*방문\s*후", change.details)
+            if match:
+                anchors.append(match.group(1))
+        for anchor in anchors:
+            anchor_lower = anchor.casefold().strip()
+            if not anchor_lower:
+                continue
+            for idx, act in enumerate(activities):
+                if anchor_lower in act.name.casefold() or anchor_lower in act.location.casefold():
+                    return idx + 1
+        return None
+
+    def _find_segment_index(self, activities: List[Activity], from_location: str | None, to_location: str | None) -> int | None:
+        if not from_location or not to_location:
+            return None
+        from_lower = from_location.casefold()
+        to_lower = to_location.casefold()
+        for idx in range(len(activities) - 1):
+            curr = activities[idx]
+            nxt = activities[idx + 1]
+            if (from_lower in curr.name.casefold() or from_lower in curr.location.casefold()) and (
+                to_lower in nxt.name.casefold() or to_lower in nxt.location.casefold()
+            ):
+                return idx
+        return None
+
     def _build_new_activity(self, day: int, idx: int, change: ChatChange) -> Activity:
         location_name = change.location or "새로운 장소"
+        desc = change.details or change.address or "추가된 활동입니다."
         return Activity(
             id=f"{day}-{idx}",
             name=location_name,
             location=location_name,
+            lat=change.lat,
+            lng=change.lng,
             time="18:00",
             duration="2시간",
-            description=change.details or "추가된 활동입니다.",
+            description=desc,
             image="/default-activity.jpg",
             openHours="알 수 없음",
             price="알 수 없음",
@@ -155,6 +221,10 @@ class ItineraryService:
             estimatedDuration="2시간",
             bestTime="오후",
         )
+
+    def _reindex_day_activities(self, day: int, activities: List[Activity]) -> None:
+        for idx, act in enumerate(activities, start=1):
+            act.id = f"{day}-{idx}"
 
     def _extract_current_mode(self, entity: ItineraryEntity, day_key: str) -> str | None:
         for item in entity.overview:
@@ -174,15 +244,22 @@ class ItineraryService:
         locations: List[Location] = []
         for act in activities:
             coords = coords_by_name.get(act.name.casefold())
+            lat = act.lat
+            lng = act.lng
             if coords:
                 lat, lng = coords
-            else:
+            elif lat is None or lng is None:
                 lat, lng = _coords_for(act.location)
             locations.append(Location(name=act.name, time=act.time, lat=lat, lng=lng))
         return locations
 
     async def _recompute_day_schedule(
-        self, entity: ItineraryEntity, day_key: str, activities: List[Activity], mode: str | None = "drive"
+        self,
+        entity: ItineraryEntity,
+        day_key: str,
+        activities: List[Activity],
+        mode: str | None = "drive",
+        segment_mode_overrides: Dict[int, str] | None = None,
     ) -> tuple[List[Dict[str, int | str]], List[Location]]:
         current_minutes = 8 * 60  # 08:00 시작
         coords_by_name = self._location_coord_lookup(entity, day_key)
@@ -193,7 +270,12 @@ class ItineraryService:
         routing_locations = self._build_locations(activities, coords_by_name)
         segments: List[Dict[str, int | str]] = []
         if len(routing_locations) > 1:
-            segments = await compute_route_segments(routing_locations, mode or "drive")
+            per_segment_modes: List[str] = []
+            overrides = segment_mode_overrides or {}
+            for idx in range(len(routing_locations) - 1):
+                per_segment_modes.append(overrides.get(idx, mode or "drive"))
+
+            segments = await compute_route_segments(routing_locations, mode or "drive", modes_by_index=per_segment_modes)
             durations = [int(seg.get("durationMinutes", 0) or 0) for seg in segments]
             current_minutes = 8 * 60
             for idx, act in enumerate(activities):
@@ -286,6 +368,31 @@ class ItineraryService:
                     transports=transports,
                 )
         entity.overview = [overview_by_day[key] for key in sorted(overview_by_day.keys(), key=int)]
+
+    def _summarize_changes(self, changes: List[ChatChange]) -> str:
+        if not changes:
+            return "선택하신 변경사항을 일정에 반영했습니다."
+        summaries: List[str] = []
+        for change in changes:
+            day_label = f"Day {change.day}" if change.day else "해당 일차"
+            if change.action == "add":
+                target = change.location or "새 일정"
+                summaries.append(f"{day_label}: {target} 추가")
+            elif change.action == "remove":
+                target = change.location or "일정"
+                summaries.append(f"{day_label}: {target} 제거")
+            elif change.action == "modify":
+                target = change.location or "일정"
+                summaries.append(f"{day_label}: {target} 세부정보 수정")
+            elif change.action == "transport":
+                mode_label = self._MODE_LABEL.get(_detect_mode(change.mode, change.details), "이동")
+                if change.fromLocation and change.toLocation:
+                    summaries.append(f"{day_label}: {change.fromLocation}→{change.toLocation} {mode_label} 변경")
+                else:
+                    summaries.append(f"{day_label}: 이동수단 {mode_label} 변경")
+            elif change.action == "regenerate":
+                summaries.append(f"{day_label}: 일정 재생성")
+        return " · ".join(summaries) if summaries else "선택하신 변경사항을 일정에 반영했습니다."
 
 
 def _duration_to_minutes(text: str | None, default: int = 60) -> int:
