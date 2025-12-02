@@ -11,7 +11,7 @@ from uuid import uuid4
 from langgraph.graph import END, StateGraph
 
 from app.ai.openai_client import get_client
-from app.api.models.schemas import Activity, ChatChange, ChatContext, ChatMessage, ChatPreview, ChatReply, DayItinerary, PlannerData
+from app.api.models.schemas import Activity, ChatChange, ChatContext, ChatMessage, ChatPreview, ChatReply, DayItinerary, PlannerData, TransportLeg
 from app.core.config import settings
 from app.domain.models import ItineraryEntity
 from app.external.google_places_api import search_restaurants_near
@@ -159,6 +159,34 @@ def _extract_segment_targets(
     return candidates[0][1], candidates[1][1]
 
 
+def _find_leg_between(
+    overview: List[DayItinerary],
+    activities_by_day: Dict[str, List[Activity]],
+    first: Activity,
+    second: Activity,
+) -> Optional[Tuple[int, TransportLeg, Activity, Activity]]:
+    first_key = first.name.casefold()
+    second_key = second.name.casefold()
+    for day_key, acts in activities_by_day.items():
+        a_idx = None
+        b_idx = None
+        for idx, act in enumerate(acts):
+            label = act.name.casefold()
+            if a_idx is None and first_key in label:
+                a_idx = idx
+            if b_idx is None and second_key in label:
+                b_idx = idx
+        if a_idx is None or b_idx is None:
+            continue
+        if abs(a_idx - b_idx) > 1:
+            continue
+        leg_idx = min(a_idx, b_idx)
+        overview_item = next((item for item in overview if str(item.day) == day_key), None)
+        if overview_item and leg_idx < len(overview_item.transports):
+            return int(day_key), overview_item.transports[leg_idx], acts[a_idx], acts[b_idx]
+    return None
+
+
 def _is_question_like(text: str) -> bool:
     """
     Heuristic to detect informational questions (e.g., '~이 뭐야?', '알려줘') to avoid forcing change previews.
@@ -192,7 +220,7 @@ def _classify_intent(message: ChatMessage, context: ChatContext) -> Tuple[str, i
     transport_keywords = ["교통", "이동", "버스", "subway", "지하철", "대중", "transit", "metro", "트램"]
     restaurant_keywords = ["맛집", "식당", "레스토랑", "restaurant", "먹을", "카페"]
 
-    if context.pendingAction in {"remove", "add"}:
+    if context.pendingAction in {"remove", "add", "replace"}:
         return "activity_change", day
     if context.pendingAction == "restaurant":
         return "restaurant", day
@@ -218,7 +246,7 @@ async def _llm_classify_intent(message: ChatMessage, context: ChatContext, plann
             "Return JSON with keys 'intent' and 'day'. "
             "intent should be one of ['transport','restaurant','regenerate','activity_change','question']. "
             "Use 'question' only when the user is asking for information/clarification without requesting a change. "
-            "Honor pending actions strongly: 'restaurant' -> restaurant, 'transport' -> transport, 'remove/add' -> activity_change. "
+            "Honor pending actions strongly: 'restaurant' -> restaurant, 'transport' -> transport, 'remove/add/replace' -> activity_change. "
             "day should be a positive integer if mentioned, otherwise null. "
             "Use the provided context to infer the day if the user references a day."
         )
@@ -366,6 +394,45 @@ def _route_after_classify(state: ChatState) -> str:
     return "activity_change"
 
 
+def _answer_specific_question(
+    message_text: str,
+    overview: List[DayItinerary],
+    activities_by_day: Dict[str, List[Activity]],
+    default_day: int,
+) -> Optional[str]:
+    lowered = message_text.casefold()
+    mentions: List[Tuple[int, Activity]] = []
+    for day_key, acts in activities_by_day.items():
+        for act in acts:
+            name_hit = act.name and act.name.casefold() in lowered
+            loc_hit = act.location and act.location.casefold() in lowered
+            if name_hit or loc_hit:
+                mentions.append((int(day_key), act))
+
+    if len(mentions) >= 2 and any(keyword in lowered for keyword in ["몇분", "몇 분", "거리", "걸려", "시간", "이동"]):
+        leg_info = _find_leg_between(overview, activities_by_day, mentions[0][1], mentions[1][1])
+        if leg_info:
+            day, leg, from_act, to_act = leg_info
+            return f"{from_act.name}에서 {to_act.name}까지는 {leg.summary}로 약 {leg.durationMinutes}분 걸릴 예정이에요. (Day {day})"
+
+    if mentions:
+        mentions.sort(key=lambda x: (x[0] != default_day, x[0]))
+        day, act = mentions[0]
+        if any(kw in lowered for kw in ["입장", "요금", "가격", "fee", "ticket"]):
+            return f"{act.name}의 입장료 정보예요. 표시된 금액: {act.price or '알 수 없음'} · 운영 시간: {act.openHours or '정보 없음'}"
+        if any(kw in lowered for kw in ["몇 시", "몇시", "시간", "오픈", "닫"]):
+            return f"{act.name} 운영 시간은 {act.openHours or '정보를 찾지 못했어요.'} 입니다."
+        desc = act.description or f"{act.location}에 있는 방문지입니다."
+        return (
+            f"{day}일차 일정에 포함된 {act.name}에 대한 안내입니다.\n"
+            f"- 위치: {act.location}\n"
+            f"- 예정 시각: {act.time}, 소요 시간: {act.duration or act.estimatedDuration}\n"
+            f"- 한 줄 설명: {desc}\n"
+            f"입장료: {act.price or '알 수 없음'} / 운영 시간: {act.openHours or '정보 없음'}"
+        )
+    return None
+
+
 def _summarize_day(
     day: int, planner: PlannerData, overview: List[DayItinerary], activities_by_day: Dict[str, List[Activity]]
 ) -> str:
@@ -385,6 +452,20 @@ def _summarize_day(
         f"{activity_lines}\n"
         f"현재 이동 수단은 {transport_readable} 기준으로 안내 중이에요."
     )
+
+
+def _answer_user_question(
+    message: ChatMessage,
+    context: ChatContext,
+    planner: PlannerData,
+    overview: List[DayItinerary],
+    activities_by_day: Dict[str, List[Activity]],
+) -> Tuple[str, int]:
+    day = _extract_day_from_text(message.text, context.currentDay or 1)
+    specific = _answer_specific_question(message.text, overview, activities_by_day, day)
+    if specific:
+        return specific, day
+    return _summarize_day(day, planner, overview, activities_by_day), day
 
 
 async def _llm_plan(
@@ -458,7 +539,9 @@ async def plan_question(state: ChatState) -> Dict[str, Any]:
     message = state["last_user_message"]
     context = state["context"]
     day = state.get("target_day") or _extract_day_from_text(message.text, context.currentDay or 1)
-    reply_text = _summarize_day(day, planner, state["itinerary_overview"], state["activities_by_day"])
+    reply_text, _ = _answer_user_question(
+        message, context, planner, state["itinerary_overview"], state["activities_by_day"]
+    )
     reply = ChatReply(
         id=f"msg_{uuid4().hex[:10]}",
         text=reply_text,
@@ -575,7 +658,9 @@ async def plan_activity(state: ChatState) -> Dict[str, Any]:
     day = state.get("target_day") or (context.currentDay or 1)
 
     if state.get("intent") == "question" or (_is_question_like(message.text) and context.pendingAction is None):
-        reply_text = _summarize_day(day, planner, state["itinerary_overview"], activities_by_day)
+        reply_text, _ = _answer_user_question(
+            message, context, planner, state["itinerary_overview"], activities_by_day
+        )
         reply = ChatReply(
             id=f"msg_{uuid4().hex[:10]}",
             text=reply_text,

@@ -119,6 +119,18 @@ class ItineraryService:
             elif change.action == "regenerate":
                 await self._regenerate_day(entity, day)
                 regenerated_days.add(day_key)
+            elif change.action == "replace":
+                if self._replace_activity(activities, change):
+                    mutated = True
+                else:
+                    # 찾지 못한 경우 새 활동으로 추가하여 일정이 비지 않도록 처리
+                    insert_at = self._find_insert_position(activities, change)
+                    new_activity = self._build_new_activity(day, len(activities) + 1, change)
+                    if insert_at is not None and 0 <= insert_at <= len(activities):
+                        activities.insert(insert_at, new_activity)
+                    else:
+                        activities.append(new_activity)
+                    mutated = True
             if mutated:
                 self._reindex_day_activities(day, activities)
 
@@ -186,6 +198,27 @@ class ItineraryService:
                 if anchor_lower in act.name.casefold() or anchor_lower in act.location.casefold():
                     return idx + 1
         return None
+
+    def _replace_activity(self, activities: List[Activity], change: ChatChange) -> bool:
+        target_label = change.targetLocation or change.fromLocation or change.location
+        if not target_label:
+            return False
+        target = target_label.casefold()
+        new_name = change.location or target_label
+        for act in activities:
+            if target in act.name.casefold() or target in act.location.casefold():
+                act.name = new_name
+                act.location = new_name
+                if change.details:
+                    act.description = change.details
+                if change.address:
+                    act.description = f"{change.address} · {act.description or '업데이트된 장소입니다.'}"
+                if change.lat is not None:
+                    act.lat = change.lat
+                if change.lng is not None:
+                    act.lng = change.lng
+                return True
+        return False
 
     def _find_segment_index(self, activities: List[Activity], from_location: str | None, to_location: str | None) -> int | None:
         if not from_location or not to_location:
@@ -392,6 +425,10 @@ class ItineraryService:
                     summaries.append(f"{day_label}: 이동수단 {mode_label} 변경")
             elif change.action == "regenerate":
                 summaries.append(f"{day_label}: 일정 재생성")
+            elif change.action == "replace":
+                src = change.targetLocation or change.fromLocation or "기존 일정"
+                dest = change.location or "새 일정"
+                summaries.append(f"{day_label}: {src}을 {dest}(으)로 교체")
         return " · ".join(summaries) if summaries else "선택하신 변경사항을 일정에 반영했습니다."
 
 

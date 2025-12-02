@@ -98,9 +98,10 @@ ChatSender = Literal["user", "assistant"]
 
 
 class ChatChange(BaseModel):
-    action: Literal["add", "remove", "modify", "transport", "regenerate"]
+    action: Literal["add", "remove", "modify", "transport", "regenerate", "replace"]
     day: Optional[int] = None
     location: Optional[str] = None
+    targetLocation: Optional[str] = None
     details: Optional[str] = None
     mode: Optional["TransportMode"] = None
     afterActivityName: Optional[str] = None
@@ -157,7 +158,7 @@ class CreateItineraryResponse(Itinerary):
 class ChatContext(BaseModel):
     currentView: Literal["overview", "daily"]
     currentDay: Optional[int] = None
-    pendingAction: Optional[Literal["remove", "add", "transport", "restaurant"]] = None
+    pendingAction: Optional[Literal["remove", "add", "transport", "restaurant", "replace"]] = None
 
 
 class ChatRequest(BaseModel):
