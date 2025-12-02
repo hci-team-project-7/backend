@@ -14,8 +14,8 @@
 ```
 # OpenAI (여행 일정/챗 품질 향상)
 OPENAI_API_KEY=sk-...
-OPENAI_MODEL_ITINERARY=gpt-4.1          # 선택, 기본 gpt-4.1
-OPENAI_MODEL_CHAT=gpt-4.1-mini          # 선택, 기본 gpt-4.1-mini
+OPENAI_MODEL_ITINERARY=gpt-5.1          # 선택, 기본 gpt-5.1
+OPENAI_MODEL_CHAT=gpt-5.1               # 선택, 기본 gpt-5.1
 
 # Google API (장소/경로 추천 고도화)
 GOOGLE_PLACES_API_KEY=your-places-key   # 없으면 내부 기본 POI만 사용
@@ -45,4 +45,3 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - 실행 후 헬스 체크: `GET http://localhost:8000/health`
 - Swagger UI: `http://localhost:8000/docs`
 - API 상세 스펙: `backend/rest_api_spec.md`
-

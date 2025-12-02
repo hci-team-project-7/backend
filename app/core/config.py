@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
 
     openai_api_key: str = Field(default="", description="Optional OpenAI API key")
-    openai_model_itinerary: str = "gpt-4.1"
-    openai_model_chat: str = "gpt-4.1-mini"
+    openai_model_itinerary: str = "gpt-5.1"
+    openai_model_chat: str = "gpt-5.1"
 
     google_places_api_key: str | None = None
     google_routes_api_key: str | None = None
