@@ -286,6 +286,47 @@ def _build_rule_based_preview(
     city = planner.cities[0] if planner.cities else planner.country
     text_lower = message.text.lower()
 
+    if context.pendingAction == "replace":
+        target_day, anchor_act = _find_activity_match(activities_by_day, message.text, day)
+        target_day = target_day or day
+        anchor = anchor_act or _choose_fallback_activity(activities_by_day.get(str(target_day), []))
+        anchor_name = anchor.name if anchor else city
+        recommendations = [
+            {
+                "name": f"{city} 새로운 명소",
+                "location": city,
+                "rating": 4.6,
+                "cuisine": "볼거리",
+                "anchorActivityName": anchor_name,
+                "isDemo": True,
+                "source": "demo",
+            },
+            {
+                "name": f"{city} 분위기 좋은 카페",
+                "location": f"{city} 시내",
+                "rating": 4.5,
+                "cuisine": "카페",
+                "anchorActivityName": anchor_name,
+                "isDemo": True,
+                "source": "demo",
+            },
+            {
+                "name": f"{city} 정원 산책",
+                "location": city,
+                "rating": 4.4,
+                "cuisine": "산책",
+                "anchorActivityName": anchor_name,
+                "isDemo": True,
+                "source": "demo",
+            },
+        ]
+        preview = ChatPreview(
+            type="recommendation",
+            title=f"{anchor_name} 대체 후보",
+            recommendations=recommendations,
+        )
+        return preview, f"{anchor_name}을(를) 대신할 장소를 추천했어요. 마음에 드는 곳을 선택하거나 직접 입력해 주세요."
+
     if context.pendingAction == "restaurant" or "맛집" in text_lower or "restaurant" in text_lower:
         preview = ChatPreview(
             type="recommendation",
@@ -367,6 +408,43 @@ def _build_rule_based_preview(
 
     preview = _fallback_change_preview(day, activities_by_day.get(str(day), []))
     return preview, f"{day}일차 일정을 조금 더 여유롭게 조정해 보았어요."
+
+
+def _normalize_preview_data(preview_data: Any, fallback_day: int) -> Any:
+    """
+    Coerce LLM preview payload into a schema-safe structure:
+    - fill missing/invalid day with the current fallback day
+    - drop invalid transport mode values instead of failing validation
+    """
+    if not isinstance(preview_data, dict):
+        return preview_data
+    normalized = dict(preview_data)
+    changes = normalized.get("changes")
+    if isinstance(changes, list):
+        fixed_changes: List[Dict[str, Any]] = []
+        for ch in changes:
+            if not isinstance(ch, dict):
+                continue
+            item = dict(ch)
+            action = item.get("action")
+            if action not in {"add", "remove", "modify", "transport", "regenerate", "replace"}:
+                item["action"] = "modify"
+            day = item.get("day")
+            if not isinstance(day, int) or day <= 0:
+                item["day"] = fallback_day
+            mode_val = item.get("mode")
+            if mode_val is not None:
+                try:
+                    mode_str = str(mode_val).lower()
+                except Exception:
+                    mode_str = None
+                if mode_str not in {"drive", "walk", "transit", "bike"}:
+                    item["mode"] = None
+                else:
+                    item["mode"] = mode_str
+            fixed_changes.append(item)
+        normalized["changes"] = fixed_changes
+    return normalized
 
 
 async def classify_intent(state: ChatState) -> Dict[str, Any]:
@@ -508,7 +586,8 @@ async def _llm_plan(
         preview_data = payload.get("preview")
         if preview_data:
             try:
-                preview = ChatPreview.model_validate(preview_data)
+                sanitized = _normalize_preview_data(preview_data, day)
+                preview = ChatPreview.model_validate(sanitized)
             except Exception as exc:  # pragma: no cover - schema mismatch
                 logger.warning("Preview validation failed, fallback to rule-based preview: %s", exc)
     except Exception as exc:  # pragma: no cover - network dependent

@@ -70,6 +70,26 @@ def _time_for_slot(slot: int) -> str:
     return f"{hour:02d}:00"
 
 
+def _is_meal_activity(name: str | None) -> bool:
+    if not name:
+        return False
+    lowered = name.casefold()
+    return "식사" in lowered or "breakfast" in lowered or "lunch" in lowered or "dinner" in lowered
+
+
+def _choose_photo_from_activities(activities: List[Activity], default: str = "/city-arrival.jpg") -> str:
+    """
+    Pick the first non-meal activity image that isn't a placeholder.
+    """
+    for act in activities:
+        if _is_meal_activity(act.name):
+            continue
+        img = getattr(act, "image", None)
+        if img and img not in {"/default-activity.jpg", "/placeholder.svg", "/placeholder.jpg"}:
+            return img
+    return default
+
+
 async def collect_pois(state: ItineraryState) -> Dict[str, Any]:
     planner = state["planner_data"]
     client = get_client()
@@ -193,6 +213,7 @@ async def schedule_days(state: ItineraryState) -> Dict[str, Any]:
         highlight = poi.get("highlight") or f"{city}에서 즐기는 추천 일정입니다."
         highlight = highlight if isinstance(highlight, str) else str(highlight)
         description = await translate_text_to_korean(highlight)
+        image = poi.get("image") or "/default-activity.jpg"
         activity = Activity(
             id=f"{day}-{slot}",
             name=name,
@@ -202,7 +223,7 @@ async def schedule_days(state: ItineraryState) -> Dict[str, Any]:
             time="00:00",  # 초기값, 이후 enrich_with_routes에서 실제 시간 재계산
             duration=f"{duration_min}분",
             description=description,
-            image="/default-activity.jpg",
+            image=image,
             openHours="알 수 없음",
             price="알 수 없음",
             tips=[f"{name} 방문 전 운영시간을 확인하세요."],
@@ -314,12 +335,13 @@ async def schedule_days(state: ItineraryState) -> Dict[str, Any]:
             locations.append(Location(name=act.name, time=act.time, lat=lat, lng=lng))
 
         day_date = start_date + timedelta(days=day - 1)
+        photo = _choose_photo_from_activities(activities, "/city-arrival.jpg")
         day_plans.append(
             DayItinerary(
                 day=day,
                 date=day_date,
                 title=f"{day}일차 {city} 일정",
-                photo="/city-arrival.jpg",
+                photo=photo,
                 activities=[a.name for a in activities],
                 locations=locations,
             )
@@ -419,14 +441,30 @@ async def enrich_with_details(state: ItineraryState) -> Dict[str, Any]:
                 for idx, llm_act in enumerate(llm_activities):
                     if idx >= len(activities):
                         break
-                    activities[idx] = Activity.model_validate(
-                        {
-                            **llm_act,
-                            "id": activities[idx].id,
-                            "time": activities[idx].time,
-                            "location": llm_act.get("location") or activities[idx].location,
-                        }
-                    )
+                    current = activities[idx]
+
+                    # LLM 응답이 이미지/좌표를 모르면 기존 Google Places 결과를 보존한다.
+                    llm_image = (llm_act.get("image") or "").strip()
+                    is_placeholder = llm_image in {
+                        "",
+                        "/placeholder.svg",
+                        "/placeholder.jpg",
+                        "/default-activity.jpg",
+                    }
+                    merged_image = current.image if is_placeholder else llm_image
+
+                    merged_payload = {
+                        **current.model_dump(),
+                        **llm_act,
+                        "id": current.id,
+                        "time": current.time,
+                        "location": llm_act.get("location") or current.location,
+                        # 좌표와 이미지가 날아가지 않도록 보호
+                        "lat": current.lat,
+                        "lng": current.lng,
+                        "image": merged_image or current.image,
+                    }
+                    activities[idx] = Activity.model_validate(merged_payload)
                 enriched = True
             except Exception as exc:  # pragma: no cover - network dependent
                 logger.warning("OpenAI activity enrichment failed: %s", exc)
@@ -443,6 +481,7 @@ async def enrich_with_details(state: ItineraryState) -> Dict[str, Any]:
 
         state["activities_by_day"][str(plan.day)] = activities
         plan.activities = [a.name for a in activities]
+        plan.photo = _choose_photo_from_activities(activities, plan.photo or "/city-arrival.jpg")
     return state
 
 

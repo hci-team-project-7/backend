@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import logging
 import re
 from typing import Dict, List
 from uuid import uuid4
@@ -10,7 +11,10 @@ from app.api.models.schemas import Activity, ChatChange, DayItinerary, Location,
 from app.core.errors import ValidationError
 from app.domain.models import ItineraryEntity
 from app.domain.repositories import ItineraryRepository
+from app.external.google_places_api import fetch_place_details
 from app.external.routes_api import compute_route_segments
+
+logger = logging.getLogger(__name__)
 
 
 class ItineraryService:
@@ -120,7 +124,7 @@ class ItineraryService:
                 await self._regenerate_day(entity, day)
                 regenerated_days.add(day_key)
             elif change.action == "replace":
-                if self._replace_activity(activities, change):
+                if await self._replace_activity(entity, activities, change):
                     mutated = True
                 else:
                     # 찾지 못한 경우 새 활동으로 추가하여 일정이 비지 않도록 처리
@@ -199,7 +203,7 @@ class ItineraryService:
                     return idx + 1
         return None
 
-    def _replace_activity(self, activities: List[Activity], change: ChatChange) -> bool:
+    async def _replace_activity(self, entity: ItineraryEntity, activities: List[Activity], change: ChatChange) -> bool:
         target_label = change.targetLocation or change.fromLocation or change.location
         if not target_label:
             return False
@@ -208,15 +212,42 @@ class ItineraryService:
         for act in activities:
             if target in act.name.casefold() or target in act.location.casefold():
                 act.name = new_name
-                act.location = new_name
+                city_hint = (
+                    change.address
+                    or act.location
+                    or (entity.planner_data.cities[0] if entity.planner_data.cities else entity.planner_data.country)
+                )
+                desc_parts: List[str] = []
+                # Try to hydrate with real POI data so the card reflects the new place
+                try:
+                    place = await fetch_place_details(new_name, city=str(city_hint) if city_hint else None)
+                except Exception as exc:  # pragma: no cover - network dependent
+                    logger.warning("Failed to fetch place details for '%s': %s", new_name, exc)
+                    place = None
+
+                if place:
+                    act.location = place.get("address") or change.address or new_name
+                    act.lat = place.get("lat") if place.get("lat") is not None else change.lat or act.lat
+                    act.lng = place.get("lng") if place.get("lng") is not None else change.lng or act.lng
+                    if place.get("image"):
+                        act.image = place["image"]
+                    highlight = place.get("highlight")
+                    if highlight:
+                        desc_parts.append(str(highlight))
+                else:
+                    act.location = change.address or new_name
+                    if change.lat is not None:
+                        act.lat = change.lat
+                    if change.lng is not None:
+                        act.lng = change.lng
+
                 if change.details:
-                    act.description = change.details
-                if change.address:
-                    act.description = f"{change.address} · {act.description or '업데이트된 장소입니다.'}"
-                if change.lat is not None:
-                    act.lat = change.lat
-                if change.lng is not None:
-                    act.lng = change.lng
+                    desc_parts.append(change.details)
+                if not desc_parts:
+                    desc_parts.append(f"{new_name} 방문 일정으로 업데이트했습니다.")
+                act.description = " · ".join(dict.fromkeys(desc_parts))
+                act.tips = [f"{new_name} 방문 전 운영 시간을 확인하세요."]
+                act.nearbyFood = [f"{new_name} 인근 맛집 탐방"]
                 return True
         return False
 
@@ -270,6 +301,17 @@ class ItineraryService:
         if not existing:
             return {}
         return {loc.name.casefold(): (loc.lat, loc.lng) for loc in existing.locations or []}
+
+    def _select_day_photo(self, activities: List[Activity], current_photo: str | None = None) -> str:
+        for act in activities:
+            name = act.name or ""
+            lowered = name.casefold()
+            if "식사" in lowered or "breakfast" in lowered or "lunch" in lowered or "dinner" in lowered:
+                continue
+            img = getattr(act, "image", None)
+            if img and img not in {"/default-activity.jpg", "/placeholder.svg", "/placeholder.jpg"}:
+                return img
+        return current_photo or "/city-arrival.jpg"
 
     def _build_locations(
         self, activities: List[Activity], coords_by_name: Dict[str, tuple[float, float]]
@@ -367,6 +409,9 @@ class ItineraryService:
                 segments = await compute_route_segments(locations, mode or "drive")
             segments = segments or []
             transports: List[TransportLeg] = []
+            photo = self._select_day_photo(
+                activities, overview_by_day[day_key].photo if day_key in overview_by_day else None
+            )
             for idx, seg in enumerate(segments):
                 if idx >= len(activities) - 1:
                     break
@@ -388,6 +433,7 @@ class ItineraryService:
                 item.activities = [act.name for act in activities]
                 item.locations = locations
                 item.transports = transports
+                item.photo = photo
             else:
                 day = int(day_key)
                 date = entity.planner_data.dateRange.start + timedelta(days=day - 1)
@@ -395,7 +441,7 @@ class ItineraryService:
                     day=day,
                     date=date,
                     title=f"Day {day} 일정",
-                    photo="/city-arrival.jpg",
+                    photo=photo,
                     activities=[act.name for act in activities],
                     locations=locations,
                     transports=transports,

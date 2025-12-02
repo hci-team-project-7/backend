@@ -11,6 +11,8 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
+LEGACY_TEXTSEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+LEGACY_NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 PLACES_FIELD_MASK = (
     "places.displayName,"
     "places.formattedAddress,"
@@ -19,7 +21,8 @@ PLACES_FIELD_MASK = (
     "places.rating,"
     "places.userRatingCount,"
     "places.primaryType,"
-    "places.editorialSummary"
+    "places.editorialSummary,"
+    "places.photos"
 )
 
 
@@ -30,6 +33,8 @@ async def _search_places(query: str, max_results: int = 8) -> List[Dict[str, Any
     """
     if not settings.google_places_api_key:
         return []
+
+    places: List[Dict[str, Any]] = []
 
     headers = {
         "X-Goog-Api-Key": settings.google_places_api_key,
@@ -46,9 +51,39 @@ async def _search_places(query: str, max_results: int = 8) -> List[Dict[str, Any
             resp = await client.post(PLACES_URL, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data.get("places", [])
+            places = data.get("places", []) or []
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Google Places search failed for '%s': %s", query, exc)
+        places = []
+
+    if places:
+        return places
+
+    # Fallback to legacy Places Text Search when the new API isn't enabled
+    return await _search_places_legacy(query, max_results)
+
+
+async def _search_places_legacy(query: str, max_results: int = 8) -> List[Dict[str, Any]]:
+    """
+    Backup search using the classic Places Text Search API.
+    Useful when the new Places API (v1) is not enabled for the provided key.
+    """
+    if not settings.google_places_api_key:
+        return []
+
+    params = {
+        "query": query,
+        "language": "ko",
+        "key": settings.google_places_api_key,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(LEGACY_TEXTSEARCH_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            return (data.get("results") or [])[:max_results]
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Legacy Places search failed for '%s': %s", query, exc)
         return []
 
 
@@ -65,6 +100,8 @@ async def search_restaurants_near(
     """
     if not settings.google_places_api_key:
         return []
+
+    places: List[Dict[str, Any]] = []
 
     headers = {
         "X-Goog-Api-Key": settings.google_places_api_key,
@@ -86,9 +123,31 @@ async def search_restaurants_near(
             resp = await client.post(PLACES_URL, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data.get("places", [])
+            places = data.get("places", []) or []
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Google Places nearby search failed for '%s': %s", anchor_name, exc)
+        places = []
+
+    if places:
+        return places
+
+    # Fallback: classic Places Nearby Search API
+    legacy_params = {
+        "location": f"{lat},{lng}",
+        "radius": radius_m,
+        "keyword": anchor_name,
+        "type": "restaurant",
+        "language": "ko",
+        "key": settings.google_places_api_key,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(LEGACY_NEARBY_URL, params=legacy_params)
+            resp.raise_for_status()
+            data = resp.json()
+            return (data.get("results") or [])[:max_results]
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Legacy nearby search failed for '%s': %s", anchor_name, exc)
         return []
 
 
@@ -97,12 +156,13 @@ def _normalize_place(place: Dict[str, Any], city: str, style: str) -> Dict[str, 
     if not name:
         return None
 
-    location = place.get("location", {}) or {}
-    lat = location.get("latitude")
-    lng = location.get("longitude")
+    # Support both Places v1 (location.latitude) and classic API (geometry.location.lat)
+    location = place.get("location", {}) or place.get("geometry", {}).get("location", {}) or {}
+    lat = location.get("latitude") or location.get("lat")
+    lng = location.get("longitude") or location.get("lng")
 
     rating = place.get("rating")
-    user_count = place.get("userRatingCount", 0) or 0
+    user_count = place.get("userRatingCount", place.get("user_ratings_total", 0)) or 0
     style_score = 6.5
     if rating:
         style_score += min(3.0, rating / 2)
@@ -110,13 +170,38 @@ def _normalize_place(place: Dict[str, Any], city: str, style: str) -> Dict[str, 
         style_score += 0.5
 
     types = place.get("types") or []
-    place_type = place.get("primaryType") or (types[0] if types else style)
+    place_type = place.get("primaryType") or place.get("primary_type") or (types[0] if types else style)
 
     highlight = (
         (place.get("editorialSummary") or {}).get("text")
         or place.get("formattedAddress")
+        or place.get("formatted_address")
         or place_type
     )
+
+    def _extract_photo_url() -> str | None:
+        photos = place.get("photos") or []
+        if not photos:
+            return None
+        photo = photos[0] or {}
+
+        # Places API (new) photo name -> media endpoint
+        photo_name = photo.get("name")
+        if photo_name:
+            return f"https://places.googleapis.com/v1/{photo_name}/media?maxWidthPx=800&key={settings.google_places_api_key}"
+
+        # New API sometimes returns a direct URI
+        direct_uri = photo.get("photoUri")
+        if direct_uri:
+            return direct_uri
+
+        # Classic Places API photo_reference
+        ref = photo.get("photo_reference") or photo.get("photoReference")
+        if ref:
+            return f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photo_reference={ref}&key={settings.google_places_api_key}"
+        return None
+
+    photo_url = _extract_photo_url()
 
     return {
         "name": name,
@@ -128,8 +213,9 @@ def _normalize_place(place: Dict[str, Any], city: str, style: str) -> Dict[str, 
         "highlight": highlight,
         "rating": rating,
         "userRatingsTotal": user_count,
-        "address": place.get("formattedAddress"),
+        "address": place.get("formattedAddress") or place.get("formatted_address"),
         "source": "google_places",
+        "image": photo_url,
     }
 
 
@@ -162,3 +248,23 @@ async def search_places_for_planner(planner_data: PlannerData, max_results_per_c
                 pois.append(normalized)
 
     return pois
+
+
+async def fetch_place_details(query: str, city: str | None = None, style: str = "attraction") -> Dict[str, Any] | None:
+    """
+    Lightweight helper to fetch a single place record and normalize it for itinerary updates.
+    Falls back to None when API access is unavailable.
+    """
+    if not query:
+        return None
+
+    search_query = query
+    if city and city not in query:
+        search_query = f"{query} {city}"
+
+    places = await _search_places(search_query, max_results=3)
+    for place in places:
+        normalized = _normalize_place(place, city=city or query, style=style)
+        if normalized:
+            return normalized
+    return None
