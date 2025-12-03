@@ -26,7 +26,11 @@ PLACES_FIELD_MASK = (
 )
 
 
-async def _search_places(query: str, max_results: int = 8) -> List[Dict[str, Any]]:
+async def _search_places(
+    query: str,
+    max_results: int = 8,
+    location_bias: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
     """
     Raw Google Places text search call.
     Returns the raw place objects from the API.
@@ -45,6 +49,8 @@ async def _search_places(query: str, max_results: int = 8) -> List[Dict[str, Any
         "pageSize": max_results,
         "languageCode": "ko",
     }
+    if location_bias:
+        payload["locationBias"] = location_bias
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -149,6 +155,54 @@ async def search_restaurants_near(
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Legacy nearby search failed for '%s': %s", anchor_name, exc)
         return []
+
+
+async def search_replacement_places(
+    city: str,
+    anchor_name: str | None,
+    styles: list[str] | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    max_results: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Suggest alternative POIs for a replacement request using Google Places search.
+    Biases results around the anchor coordinates when available.
+    """
+    if not settings.google_places_api_key:
+        return []
+
+    queries: List[str] = []
+    anchor_clean = (anchor_name or "").strip()
+    if anchor_clean:
+        queries.append(f"{anchor_clean} 주변 볼거리")
+        queries.append(f"{anchor_clean} 근처 명소")
+    queries.append(f"{city} 인기 명소")
+    for style in styles or []:
+        if style:
+            queries.append(f"{city} {style}")
+
+    seen: set[str] = set()
+    recommendations: List[Dict[str, Any]] = []
+    bias = None
+    if lat is not None and lng is not None:
+        bias = {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": 5000}}
+
+    for query in queries:
+        raw_places = await _search_places(query, max_results=max_results, location_bias=bias)
+        for place in raw_places:
+            normalized = _normalize_place(place, city=city, style=(styles or ["attraction"])[0])
+            if not normalized:
+                continue
+            key = normalized["name"].casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            recommendations.append(normalized)
+            if len(recommendations) >= max_results:
+                return recommendations
+
+    return recommendations
 
 
 def _normalize_place(place: Dict[str, Any], city: str, style: str) -> Dict[str, Any] | None:

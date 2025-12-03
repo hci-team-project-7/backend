@@ -14,7 +14,7 @@ from app.ai.openai_client import get_client
 from app.api.models.schemas import Activity, ChatChange, ChatContext, ChatMessage, ChatPreview, ChatReply, DayItinerary, PlannerData, TransportLeg
 from app.core.config import settings
 from app.domain.models import ItineraryEntity
-from app.external.google_places_api import search_restaurants_near
+from app.external.google_places_api import search_replacement_places, search_restaurants_near
 from app.ai.itinerary_graph import _coords_for
 
 logger = logging.getLogger(__name__)
@@ -275,11 +275,12 @@ async def _llm_classify_intent(message: ChatMessage, context: ChatContext, plann
         return None, None
 
 
-def _build_rule_based_preview(
+async def _build_rule_based_preview(
     message: ChatMessage,
     context: ChatContext,
     planner: PlannerData,
     activities_by_day: Dict[str, List[Activity]],
+    overview: List[DayItinerary],
 ) -> Tuple[ChatPreview, str]:
     default_day = context.currentDay or 1
     day = _extract_day_from_text(message.text, default_day)
@@ -291,7 +292,58 @@ def _build_rule_based_preview(
         target_day = target_day or day
         anchor = anchor_act or _choose_fallback_activity(activities_by_day.get(str(target_day), []))
         anchor_name = anchor.name if anchor else city
-        recommendations = [
+        anchor_coords = _lookup_activity_coords(overview, target_day, anchor_name) or _lookup_activity_coords(
+            overview, day, anchor_name
+        )
+        lat = anchor_coords[0] if anchor_coords else None
+        lng = anchor_coords[1] if anchor_coords else None
+        raw_places = await search_replacement_places(
+            city=city,
+            anchor_name=anchor_name,
+            styles=planner.styles,
+            lat=lat,
+            lng=lng,
+            max_results=6,
+        )
+
+        recommendations: List[Dict[str, Any]] = []
+        for place in raw_places:
+            plat = place.get("lat")
+            plng = place.get("lng")
+            dist = None
+            walking_minutes = None
+            driving_minutes = None
+            if lat is not None and lng is not None and plat is not None and plng is not None:
+                dist = _haversine_distance_m(float(lat), float(lng), float(plat), float(plng))
+                walking_minutes = int(dist / 80)
+                driving_minutes = int(dist / 600)
+            recommendations.append(
+                {
+                    "name": place.get("name"),
+                    "location": place.get("address") or place.get("city") or city,
+                    "address": place.get("address") or place.get("highlight") or city,
+                    "cuisine": place.get("type"),
+                    "rating": place.get("rating"),
+                    "userRatingsTotal": place.get("userRatingsTotal"),
+                    "lat": plat,
+                    "lng": plng,
+                    "distanceMeters": dist,
+                    "walkingMinutes": walking_minutes,
+                    "drivingMinutes": driving_minutes,
+                    "anchorActivityName": anchor_name,
+                    "source": place.get("source"),
+                }
+            )
+        if recommendations:
+            preview = ChatPreview(
+                type="recommendation",
+                title=f"{anchor_name} 대체 후보",
+                recommendations=recommendations,
+            )
+            return preview, f"{anchor_name}을(를) 일정에서 제외하고 다른 후보를 추천했어요. 마음에 드는 곳을 선택하거나 직접 입력해 주세요."
+
+        # 마지막 안전장치: 검색 실패 시 데모 카드라도 반환
+        fallback = [
             {
                 "name": f"{city} 새로운 명소",
                 "location": city,
@@ -323,7 +375,7 @@ def _build_rule_based_preview(
         preview = ChatPreview(
             type="recommendation",
             title=f"{anchor_name} 대체 후보",
-            recommendations=recommendations,
+            recommendations=fallback,
         )
         return preview, f"{anchor_name}을(를) 대신할 장소를 추천했어요. 마음에 드는 곳을 선택하거나 직접 입력해 주세요."
 
@@ -683,7 +735,9 @@ async def plan_restaurant(state: ChatState) -> Dict[str, Any]:
             )
 
     if not recommendations:
-        preview, reply_text = _build_rule_based_preview(message, context, planner, activities_by_day)
+        preview, reply_text = await _build_rule_based_preview(
+            message, context, planner, activities_by_day, state["itinerary_overview"]
+        )
         reply = ChatReply(
             id=f"msg_{uuid4().hex[:10]}",
             text=reply_text or "근처 맛집을 추천했어요. 마음에 드는 곳을 선택해 주세요.",
@@ -697,7 +751,7 @@ async def plan_restaurant(state: ChatState) -> Dict[str, Any]:
     preview = ChatPreview(type="recommendation", title=title, recommendations=recommendations)
     reply = ChatReply(
         id=f"msg_{uuid4().hex[:10]}",
-        text=f"{anchor_name} 주변에서 가볼 만한 장소를 골라봤어요. 마음에 드는 곳을 선택하면 일정에 바로 반영할게요.",
+        text=f"{anchor_name} 주변에서 가볼 만한 맛집을 골라봤어요. 마음에 드는 곳을 선택하면 일정에 바로 반영할게요.",
         sender="assistant",
         timestamp=datetime.utcnow(),
         preview=preview,
@@ -754,7 +808,9 @@ async def plan_activity(state: ChatState) -> Dict[str, Any]:
         if _is_question_like(message.text) and context.pendingAction is None:
             reply_text = reply_text or _summarize_day(day, planner, state["itinerary_overview"], activities_by_day)
         else:
-            preview, fallback_reply = _build_rule_based_preview(message, context, planner, activities_by_day)
+            preview, fallback_reply = await _build_rule_based_preview(
+                message, context, planner, activities_by_day, state["itinerary_overview"]
+            )
             reply_text = reply_text or fallback_reply
 
     reply = ChatReply(
